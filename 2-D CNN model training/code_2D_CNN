@@ -1,0 +1,350 @@
+import numpy as np
+from scipy import ndimage
+from sklearn.model_selection import train_test_split
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+# -------------------------------------------------------------
+# 1. PREPARE 2D TRAINING DATA (SLICE-BASED)
+# -------------------------------------------------------------
+def prepare_2d_training_data(converted_volumes_data, lung_masks_refined_data, target_size=(128, 128)):
+    """
+    Prepare 2D slice-based training data.
+    Each slice becomes an independent training sample.
+    
+    Args:
+        converted_volumes_data: Dictionary with CT volumes
+        lung_masks_refined_data: Dictionary with lung masks
+        target_size: Target size for each slice (height, width)
+    
+    Returns:
+        X_train: Array of shape (n_slices, height, width, 1)
+        y_train: Array of shape (n_slices, height, width, 1)
+    """
+    
+    X_slices = []
+    y_slices = []
+    
+    print("\n" + "="*60)
+    print("PREPARING 2D SLICE-BASED TRAINING DATA")
+    print("="*60)
+    print(f"Target slice size: {target_size}")
+    print("="*60)
+    
+    for patient_id, data in converted_volumes_data.items():
+        
+        volume_ct_hu = data.get('volume_ct_hu')
+        lung_mask_refined = lung_masks_refined_data.get(patient_id)
+        
+        # Skip if missing data
+        if volume_ct_hu is None or lung_mask_refined is None:
+            continue
+        
+        # Skip if shapes don't match
+        if volume_ct_hu.shape != lung_mask_refined.shape:
+            continue
+        
+        try:
+            # Normalize CT volume to [0, 1]
+            min_hu = np.min(volume_ct_hu)
+            max_hu = np.max(volume_ct_hu)
+            
+            if (max_hu - min_hu) == 0:
+                normalized_volume = np.zeros_like(volume_ct_hu, dtype=np.float32)
+            else:
+                normalized_volume = (volume_ct_hu - min_hu) / (max_hu - min_hu)
+            
+            # Process each slice in the volume
+            num_slices = volume_ct_hu.shape[0]
+            
+            for slice_idx in range(num_slices):
+                # Extract slice
+                ct_slice = normalized_volume[slice_idx, :, :]
+                mask_slice = lung_mask_refined[slice_idx, :, :]
+                
+                # Skip empty slices (no lung tissue)
+                if np.sum(mask_slice) == 0:
+                    continue
+                
+                # Resize slice to target size
+                ct_resized = ndimage.zoom(
+                    ct_slice,
+                    [target_size[0] / ct_slice.shape[0], 
+                     target_size[1] / ct_slice.shape[1]],
+                    order=1,  # Linear interpolation
+                    mode='nearest'
+                )
+                
+                mask_resized = ndimage.zoom(
+                    mask_slice,
+                    [target_size[0] / mask_slice.shape[0], 
+                     target_size[1] / mask_slice.shape[1]],
+                    order=0  # Nearest neighbor
+                )
+                mask_resized = (mask_resized > 0.5).astype(np.uint8)
+                
+                # Append slices
+                X_slices.append(ct_resized)
+                y_slices.append(mask_resized)
+        
+        except Exception as e:
+            continue
+    
+    # Convert to numpy arrays
+    if len(X_slices) == 0:
+        raise ValueError("No valid slices found!")
+    
+    X_train = np.array(X_slices, dtype=np.float32)
+    y_train = np.array(y_slices, dtype=np.uint8)
+    
+    # Add channel dimension: (n, h, w) -> (n, h, w, 1)
+    X_train = X_train[..., np.newaxis]
+    y_train = y_train[..., np.newaxis]
+    
+    print("\n" + "="*60)
+    print("DATA PREPARATION COMPLETE")
+    print("="*60)
+    print(f"X_train shape: {X_train.shape}")
+    print(f"y_train shape: {y_train.shape}")
+    print(f"Total slices: {X_train.shape[0]}")
+    print("="*60)
+    
+    return X_train, y_train
+
+
+# -------------------------------------------------------------
+# 2. BUILD 2D U-NET MODEL
+# -------------------------------------------------------------
+def build_2d_unet(input_shape=(128, 128, 1)):
+    """
+    Build a 2D U-Net for slice-based lung segmentation.
+    """
+    inputs = keras.Input(shape=input_shape)
+
+    # Encoder
+    c1 = layers.Conv2D(32, 3, activation='relu', padding='same', kernel_initializer='he_normal')(inputs)
+    c1 = layers.Dropout(0.1)(c1)
+    c1 = layers.Conv2D(32, 3, activation='relu', padding='same', kernel_initializer='he_normal')(c1)
+    p1 = layers.MaxPooling2D(2)(c1)
+
+    c2 = layers.Conv2D(64, 3, activation='relu', padding='same', kernel_initializer='he_normal')(p1)
+    c2 = layers.Dropout(0.1)(c2)
+    c2 = layers.Conv2D(64, 3, activation='relu', padding='same', kernel_initializer='he_normal')(c2)
+    p2 = layers.MaxPooling2D(2)(c2)
+
+    c3 = layers.Conv2D(128, 3, activation='relu', padding='same', kernel_initializer='he_normal')(p2)
+    c3 = layers.Dropout(0.2)(c3)
+    c3 = layers.Conv2D(128, 3, activation='relu', padding='same', kernel_initializer='he_normal')(c3)
+    p3 = layers.MaxPooling2D(2)(c3)
+
+    c4 = layers.Conv2D(256, 3, activation='relu', padding='same', kernel_initializer='he_normal')(p3)
+    c4 = layers.Dropout(0.2)(c4)
+    c4 = layers.Conv2D(256, 3, activation='relu', padding='same', kernel_initializer='he_normal')(c4)
+    p4 = layers.MaxPooling2D(2)(c4)
+
+    # Bottleneck
+    c5 = layers.Conv2D(512, 3, activation='relu', padding='same', kernel_initializer='he_normal')(p4)
+    c5 = layers.Dropout(0.3)(c5)
+    c5 = layers.Conv2D(512, 3, activation='relu', padding='same', kernel_initializer='he_normal')(c5)
+
+    # Decoder
+    u6 = layers.Conv2DTranspose(256, 2, strides=2, padding='same')(c5)
+    u6 = layers.concatenate([u6, c4])
+    c6 = layers.Conv2D(256, 3, activation='relu', padding='same', kernel_initializer='he_normal')(u6)
+    c6 = layers.Dropout(0.2)(c6)
+    c6 = layers.Conv2D(256, 3, activation='relu', padding='same', kernel_initializer='he_normal')(c6)
+
+    u7 = layers.Conv2DTranspose(128, 2, strides=2, padding='same')(c6)
+    u7 = layers.concatenate([u7, c3])
+    c7 = layers.Conv2D(128, 3, activation='relu', padding='same', kernel_initializer='he_normal')(u7)
+    c7 = layers.Dropout(0.2)(c7)
+    c7 = layers.Conv2D(128, 3, activation='relu', padding='same', kernel_initializer='he_normal')(c7)
+
+    u8 = layers.Conv2DTranspose(64, 2, strides=2, padding='same')(c7)
+    u8 = layers.concatenate([u8, c2])
+    c8 = layers.Conv2D(64, 3, activation='relu', padding='same', kernel_initializer='he_normal')(u8)
+    c8 = layers.Dropout(0.1)(c8)
+    c8 = layers.Conv2D(64, 3, activation='relu', padding='same', kernel_initializer='he_normal')(c8)
+
+    u9 = layers.Conv2DTranspose(32, 2, strides=2, padding='same')(c8)
+    u9 = layers.concatenate([u9, c1])
+    c9 = layers.Conv2D(32, 3, activation='relu', padding='same', kernel_initializer='he_normal')(u9)
+    c9 = layers.Dropout(0.1)(c9)
+    c9 = layers.Conv2D(32, 3, activation='relu', padding='same', kernel_initializer='he_normal')(c9)
+
+    outputs = layers.Conv2D(1, 1, activation='sigmoid')(c9)
+
+    model = keras.Model(inputs=inputs, outputs=outputs)
+    return model
+
+
+# -------------------------------------------------------------
+# 3. LOSS FUNCTIONS AND METRICS
+# -------------------------------------------------------------
+def dice_coefficient(y_true, y_pred, smooth=1e-6):
+    y_true_f = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
+    y_pred_f = tf.cast(tf.reshape(y_pred, [-1]), tf.float32)
+    intersection = tf.reduce_sum(y_true_f * y_pred_f)
+    return (2. * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
+
+def dice_loss(y_true, y_pred):
+    return 1 - dice_coefficient(y_true, y_pred)
+
+def combined_loss(y_true, y_pred):
+    bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
+    dice = dice_loss(y_true, y_pred)
+    return bce + dice
+
+
+# -------------------------------------------------------------
+# 4. DATA AUGMENTATION (2D)
+# -------------------------------------------------------------
+def augment_2d_slice(image, mask):
+    """Augment a 2D image-mask pair."""
+    
+    # Random rotation (90, 180, 270 degrees)
+    if np.random.rand() > 0.5:
+        k = np.random.randint(1, 4)
+        image = np.rot90(image, k=k)
+        mask = np.rot90(mask, k=k)
+    
+    # Random horizontal flip
+    if np.random.rand() > 0.5:
+        image = np.fliplr(image)
+        mask = np.fliplr(mask)
+    
+    # Random vertical flip
+    if np.random.rand() > 0.5:
+        image = np.flipud(image)
+        mask = np.flipud(mask)
+    
+    # Random intensity adjustment
+    if np.random.rand() > 0.5:
+        image = np.clip(image * np.random.uniform(0.9, 1.1), 0, 1)
+    
+    return image.copy(), mask.copy()
+
+
+# -------------------------------------------------------------
+# 5. TRAINING FUNCTION
+# -------------------------------------------------------------
+def train_2d_model(X_train, y_train, X_val=None, y_val=None, epochs=50, batch_size=16):
+    """
+    Train 2D U-Net model.
+    """
+    print("\n" + "="*60)
+    print("TRAINING 2D U-NET MODEL")
+    print("="*60)
+
+    model = build_2d_unet(input_shape=X_train.shape[1:])
+
+    model.compile(
+        optimizer=keras.optimizers.Adam(1e-4),
+        loss=combined_loss,
+        metrics=[dice_coefficient, 'binary_accuracy']
+    )
+
+    print(f"\nModel Summary:")
+    model.summary()
+
+    callbacks = [
+        keras.callbacks.ModelCheckpoint(
+            'lung_segmentation_2d_model.h5',
+            save_best_only=True,
+            monitor='val_dice_coefficient' if X_val is not None else 'dice_coefficient',
+            mode='max',
+            verbose=1
+        ),
+        keras.callbacks.EarlyStopping(
+            patience=15,
+            restore_best_weights=True,
+            verbose=1
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            factor=0.5,
+            patience=7,
+            min_lr=1e-7,
+            verbose=1
+        )
+    ]
+
+    # Data generator with augmentation
+    def data_generator(X, y, batch_size=16, augment=True):
+        while True:
+            indices = np.random.permutation(len(X))
+            for i in range(0, len(X), batch_size):
+                batch_indices = indices[i:i+batch_size]
+                batch_X, batch_y = [], []
+                
+                for idx in batch_indices:
+                    img = X[idx, :, :, 0]
+                    msk = y[idx, :, :, 0]
+                    
+                    if augment:
+                        img, msk = augment_2d_slice(img, msk)
+                    
+                    batch_X.append(img[..., np.newaxis])
+                    batch_y.append(msk[..., np.newaxis].astype(np.float32))
+                
+                yield np.array(batch_X), np.array(batch_y)
+
+    train_gen = data_generator(X_train, y_train, batch_size=batch_size, augment=True)
+    val_data = (X_val, y_val.astype(np.float32)) if X_val is not None else None
+
+    print(f"\nStarting training...")
+    print(f"Training slices: {X_train.shape[0]}")
+    if X_val is not None:
+        print(f"Validation slices: {X_val.shape[0]}")
+    print(f"Epochs: {epochs}")
+    print(f"Batch size: {batch_size}")
+    print("="*60)
+
+    history = model.fit(
+        train_gen,
+        steps_per_epoch=len(X_train) // batch_size,
+        validation_data=val_data,
+        epochs=epochs,
+        callbacks=callbacks,
+        verbose=1
+    )
+
+    print("\n" + "="*60)
+    print("✓ Training complete!")
+    print(f"✓ Model saved to: lung_segmentation_2d_model.h5")
+    print("="*60)
+    
+    return model, history
+
+
+# -------------------------------------------------------------
+# 6. MAIN EXECUTION
+# -------------------------------------------------------------
+
+# Prepare 2D training data
+# for input data, X_train use the CT arrays with Haunsfield values, y_train use the masked data (binary values 0 or 1), arrays should have same shape
+X_train, y_train = prepare_2d_training_data(
+    converted_volumes_data=converted_volumes_data,
+    lung_masks_refined_data=lung_masks_refined_data,
+    target_size=(128, 128)
+)
+
+# Split into train/validation
+X_train_split, X_val_split, y_train_split, y_val_split = train_test_split(
+    X_train, y_train, test_size=0.2, random_state=42
+)
+
+print(f"\n✓ Split: {X_train_split.shape[0]} training, {X_val_split.shape[0]} validation slices")
+
+# Train the model
+model, history = train_2d_model(
+    X_train_split, y_train_split,
+    X_val=X_val_split, y_val=y_val_split,
+    epochs=50,
+    batch_size=16
+)
+
+print("\n" + "="*60)
+print("2D U-NET TRAINING COMPLETE")
+print("="*60)
+# Once the model is trained, you can download it and use it for the rest of PET/CT scans
