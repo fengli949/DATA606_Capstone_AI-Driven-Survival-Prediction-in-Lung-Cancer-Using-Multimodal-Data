@@ -1,1 +1,2 @@
-
+# Image processing is to handle PET/CT scans (space aligning, Hauntsfield value conversion and PET scan aligning with CT scan, lung segmentation)
+# Alldata processing is to combine SUVmetrics (tumor information from PET/CT scans) with metadata, then train a ML model to predict patient survival after treatment.
