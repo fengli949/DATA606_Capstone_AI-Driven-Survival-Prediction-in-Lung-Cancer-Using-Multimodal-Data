@@ -4,4 +4,6 @@ Description: This project uses a large, multi-center clinical trial involving pa
 # Data source: https://www.cancerimagingarchive.net/collection/acrin-nsclc-fdg-pet/
 
 # Workflow of PET/CT image processing: <img width="705" height="308" alt="image" src="https://github.com/user-attachments/assets/6ba787cf-3cf8-4d13-9bda-5f729ff5515d" />
+# Workflow of data processing and ML model training <img width="653" height="296" alt="image" src="https://github.com/user-attachments/assets/a0bffe16-2881-48fa-8570-c93f522ba9c7" />
+
 
